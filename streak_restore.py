@@ -1,41 +1,48 @@
 #!/usr/bin/env python3
-"""Snap Streak Restore - fills in Snapchat's streak restore form for you.
+"""ABA Streak Restore - sends Snapchat streak restore requests for you.
 
 Type your Snapchat username, email and phone number once, then the usernames
-of the friends you lost streaks with. For each friend the tool opens
-Snapchat's official "restore my Streak" support form with every field already
-filled in, so all that's left is tapping Submit:
+of the friends you lost streaks with. The app fills in Snapchat's official
+"restore my Streak" support form for every friend:
 
     https://help.snapchat.com/hc/en-us/requests/new?co=true&ticket_form_id=149423
 
-Runs anywhere Python 3.8+ does, phones included:
+On a computer with Selenium installed it types everything into Chrome and
+presses Submit for you ("Chrome autopilot"). On a phone it opens the form
+already filled in, so all that's left is tapping Submit.
+
+Runs anywhere Python 3.8+ does:
     Android   Termux or Pydroid 3
     iPhone    a-Shell, Pyto or Pythonista
-    Computer  Windows, macOS or Linux
-
-Only the standard library is needed. The optional "Chrome autopilot" fill
-method (computers) also needs Selenium:  pip install selenium
+    Computer  Windows, macOS or Linux (pip install selenium for autopilot)
 """
 from __future__ import annotations
 
 import argparse
+import atexit
+import importlib.util
 import json
+import math
 import os
+import platform
 import re
 import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import unicodedata
+import urllib.error
+import urllib.request
 import webbrowser
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote, urlencode
 
-APP_NAME = "Snap Streak Restore"
-VERSION = "1.0.0"
+APP_NAME = "ABA Streak Restore"
+VERSION = "2.0.0"
 
 HELP_CENTER = "https://help.snapchat.com"
 TICKET_FORM_ID = "149423"
@@ -51,28 +58,33 @@ FIELD_IDS = {
 }
 
 METHODS = {
-    "link": (
-        "Pre-filled link",
-        "Opens the form in your browser with everything already filled in. "
-        "Works on phones and computers.",
+    "auto": (
+        "Automatic",
+        "Chrome autopilot on a computer with Selenium installed, pre-filled links everywhere else.",
     ),
     "chrome": (
         "Chrome autopilot",
-        "Types everything into the form in a Chrome window. "
+        "Types everything into the form in a Chrome window and presses Submit for you. "
         "Computers only, needs Selenium (pip install selenium).",
+    ),
+    "link": (
+        "Pre-filled link",
+        "Opens the form in your browser with everything filled in, you tap Submit. Works on phones.",
     ),
 }
 
 DEFAULT_SETTINGS = {
-    "method": "link",
-    "auto_submit": False,
+    "method": "auto",
+    "auto_submit": True,
     "headless": False,
     "delay": 10,
     "locale": "en-us",
     "colors": "auto",
+    "animations": True,
 }
 
 DATA_FILE_NAME = "streak_restore_data.json"
+DATA_VERSION = 2
 HISTORY_LIMIT = 500
 
 DONE_KEYS = ("", "y", "yes", "ok", "done", "sent")  # "I sent it"
@@ -164,21 +176,38 @@ def split_usernames(raw: str) -> list:
 
 class Theme:
     color = False  # ANSI colors
-    fancy = True  # Unicode box lines and emoji
+    rich = False  # 256 colors, for gradients
+    fancy = True  # Unicode blocks, lines and emoji
+    motion = False  # animations
+    cursor_hidden = False
 
 
 T = Theme()
 MARGIN = "  "
 
-_CODES = {
+FIRE = (226, 220, 214, 208, 202, 196)  # yellow -> orange -> red
+
+_BASIC = {
     "bold": "1",
     "red": "91",
     "green": "92",
     "yellow": "93",
     "cyan": "96",
     "gray": "90",
+    "faint": "90",
+    "pill": "30;103",
 }
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_RICH = {
+    "bold": "1",
+    "red": "38;5;203",
+    "green": "38;5;84",
+    "yellow": "38;5;226",
+    "cyan": "38;5;87",
+    "gray": "38;5;245",
+    "faint": "38;5;238",
+    "pill": "38;5;16;48;5;226",
+}
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 _ICONS = {  # name: (fancy, plain)
     "ghost": ("👻", ""),
@@ -198,11 +227,61 @@ STATUS_LOOK = {  # status: (icon, color, word)
     "failed": ("no", "red", "failed"),
 }
 
+LOGO = (
+    " █████╗ ██████╗  █████╗ ",
+    "██╔══██╗██╔══██╗██╔══██╗",
+    "███████║██████╔╝███████║",
+    "██╔══██║██╔══██╗██╔══██║",
+    "██║  ██║██████╔╝██║  ██║",
+    "╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝",
+)
+LOGO_PLAIN = (
+    "    _    ____    _    ",
+    "   / \\  | __ )  / \\   ",
+    "  / _ \\ |  _ \\ / _ \\  ",
+    " / ___ \\| |_) / ___ \\ ",
+    "/_/   \\_\\____/_/   \\_\\",
+)
+SUBTITLE = "S T R E A K   R E S T O R E"
+SPINNER_FRAMES = (("●∙∙", "∙●∙", "∙∙●", "∙●∙"), ("|", "/", "-", "\\"))
 
-def paint(text: str, *styles: str) -> str:
+
+def paint(text: str, *styles) -> str:
+    """Color text. Styles are names from the tables above or 256-color numbers."""
     if not T.color or not styles:
         return text
-    return "\x1b[" + ";".join(_CODES[s] for s in styles) + "m" + text + "\x1b[0m"
+    table = _RICH if T.rich else _BASIC
+    codes = []
+    for style in styles:
+        if isinstance(style, int):
+            codes.append(f"38;5;{style}" if T.rich else _BASIC["yellow"])
+        else:
+            codes.append(table[style])
+    return "\x1b[" + ";".join(codes) + "m" + text + "\x1b[0m"
+
+
+def _runs(pairs, *extra) -> str:
+    """[(color, char), ...] -> string, with one color code per run of equal colors."""
+    pieces, run, current = [], [], None
+    for color, ch in pairs:
+        if run and color != current:
+            pieces.append(paint("".join(run), current, *extra))
+            run = []
+        current = color
+        run.append(ch)
+    if run:
+        pieces.append(paint("".join(run), current, *extra))
+    return "".join(pieces)
+
+
+def gradient(text: str, span: int = 0, colors=FIRE, *extra) -> str:
+    """Color text left to right through colors (over `span` columns)."""
+    if not T.color:
+        return text
+    if not T.rich:
+        return paint(text, "yellow", *extra)
+    span = max(1, span or len(text))
+    return _runs([(colors[min(len(colors) - 1, i * len(colors) // span)], ch) for i, ch in enumerate(text)], *extra)
 
 
 def icon(name: str) -> str:
@@ -229,7 +308,7 @@ def _stdout_can_encode(text: str) -> bool:
         return False
 
 
-def setup_terminal(colors: str = "auto") -> None:
+def setup_terminal(colors: str = "auto", animations: bool = True) -> None:
     if os.name == "nt":
         os.system("")  # switches on ANSI escape handling in the Windows console
         try:
@@ -240,7 +319,8 @@ def setup_terminal(colors: str = "auto") -> None:
         sys.stdout.reconfigure(errors="replace")  # never crash on an odd character
     except (AttributeError, ValueError):
         pass
-    T.fancy = _stdout_can_encode("╭─╮│╰╯›·✓✗↷👻🔥")
+    T.fancy = _stdout_can_encode("╭─╮│╰╯━█╗╔═║›·✓✗↷●∙👻🔥")
+    tty = sys.stdout.isatty()
     if colors in ("on", "off"):
         T.color = colors == "on"
     elif os.environ.get("NO_COLOR"):
@@ -248,7 +328,35 @@ def setup_terminal(colors: str = "auto") -> None:
     elif os.environ.get("FORCE_COLOR"):
         T.color = True
     else:
-        T.color = sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+        T.color = tty and os.environ.get("TERM") != "dumb"
+    term = os.environ.get("TERM", "")
+    T.rich = T.color and (
+        "256" in term
+        or os.environ.get("COLORTERM") in ("truecolor", "24bit")
+        or os.name == "nt"
+        or is_termux()
+    )
+    T.motion = T.color and animations and tty and shutil.get_terminal_size((60, 24)).columns >= 32
+
+
+def hide_cursor() -> None:
+    if T.motion and not T.cursor_hidden:
+        sys.stdout.write("\x1b[?25l")
+        sys.stdout.flush()
+        T.cursor_hidden = True
+
+
+def show_cursor() -> None:
+    if T.cursor_hidden:
+        sys.stdout.write("\x1b[?25h")
+        sys.stdout.flush()
+        T.cursor_hidden = False
+
+
+def linger(seconds: float) -> None:
+    """A short dramatic pause, only when animations are on."""
+    if T.motion:
+        time.sleep(seconds)
 
 
 def width() -> int:
@@ -257,11 +365,22 @@ def width() -> int:
     return max(30, min(columns - 3, 58))
 
 
+def centered(text: str) -> str:
+    return " " * max(0, (width() - dwidth(text)) // 2) + text
+
+
 def out(text: str = "") -> None:
-    print(MARGIN + text if text else "")
+    print(MARGIN + text if text else "", flush=True)
 
 
-def para(text: str, *styles: str) -> None:
+def reveal(lines) -> None:
+    """Print lines, sliding them in one after another when animations are on."""
+    for line in lines:
+        out(line)
+        linger(0.012)
+
+
+def para(text: str, *styles) -> None:
     for line in textwrap.wrap(text, width()):
         out(paint(line, *styles))
 
@@ -280,50 +399,216 @@ def fail(text: str) -> None:
 
 def clear() -> None:
     if T.color:
-        print("\x1b[2J\x1b[H", end="")
+        print("\x1b[2J\x1b[H", end="", flush=True)
 
 
-def box(rows, title: str = "", style: str = "yellow", center: bool = False) -> None:
+def typewrite(prefix: str, text: str, *styles, animate: bool | None = None) -> None:
+    """Print text one letter at a time."""
+    if not (T.motion if animate is None else animate and T.motion):
+        print(prefix + paint(text, *styles), flush=True)
+        return
+    sys.stdout.write(prefix)
+    for ch in text:
+        sys.stdout.write(paint(ch, *styles))
+        sys.stdout.flush()
+        if ch != " ":
+            time.sleep(0.012)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def rule(animate: bool = False) -> None:
+    """A full-width fire-gradient line, drawn left to right when animated."""
+    w = width()
+    line = ("━" if T.fancy else "=") * w
+    if animate and T.motion:
+        for step in range(1, 13):
+            sys.stdout.write("\r" + MARGIN + gradient(line[: w * step // 12], w))
+            sys.stdout.flush()
+            time.sleep(0.015)
+        sys.stdout.write("\n")
+    else:
+        out(gradient(line, w))
+
+
+def _logo_rows(shine: int | None = None) -> list:
+    """The ABA logo, top-to-bottom fire colors, with a white diagonal glint at `shine`."""
+    rows = []
+    for r, line in enumerate(LOGO if T.fancy else LOGO_PLAIN):
+        if not T.rich:
+            rows.append(paint(line, "yellow", "bold"))
+            continue
+        base = FIRE[min(r, len(FIRE) - 1)]
+        pairs = []
+        for c, ch in enumerate(line):
+            d = c + r - shine if shine is not None else -9
+            pairs.append((231 if 0 <= d <= 2 else 230 if d in (-1, 3) else base, ch))
+        rows.append(_runs(pairs, "bold"))
+    return rows
+
+
+def header(intro: bool = False) -> None:
+    """ABA logo + title. With intro=True it drops in, shines and types itself out."""
+    logo_width = dwidth((LOGO if T.fancy else LOGO_PLAIN)[0])
+    pad = " " * max(0, (width() - logo_width) // 2)
+    animate = intro and T.motion
+    rows = _logo_rows()
+    if animate:
+        hide_cursor()
+        for row in rows:
+            out(pad + row)
+            time.sleep(0.04)
+        if T.rich:
+            for shine in list(range(-len(rows) - 3, logo_width + len(rows) + 3, 2)) + [None]:
+                sys.stdout.write(f"\x1b[{len(rows)}A")
+                for row in _logo_rows(shine):
+                    sys.stdout.write(f"\r{MARGIN}{pad}{row}\x1b[K\n")
+                sys.stdout.flush()
+                time.sleep(0.018)
+    else:
+        for row in rows:
+            out(pad + row)
+    typewrite(MARGIN + " " * max(0, (width() - len(SUBTITLE)) // 2), SUBTITLE, "bold", animate=animate)
+    rule(animate)
+    tag = f"{icon('ghost')} for Snapchat Support  {icon('dot')}  v{VERSION}".strip()
+    out(paint(centered(tag), "gray"))
+
+
+def box(rows, title: str = "", style="yellow") -> None:
     """Draw a rounded box. Rows are strings or (text, *styles) tuples."""
     w = width()
     inner = w - 4
     h, v, tl, tr, bl, br = ("─", "│", "╭", "╮", "╰", "╯") if T.fancy else ("-", "|", "+", "+", "+", "+")
+    lines = []
     if title:
         label = f" {title} "
-        out(paint(tl + h, style) + paint(label, style, "bold") + paint(h * max(0, w - 3 - dwidth(label)) + tr, style))
+        lines.append(paint(tl + h, style) + paint(label, style, "bold") + paint(h * max(0, w - 3 - dwidth(label)) + tr, style))
     else:
-        out(paint(tl + h * (w - 2) + tr, style))
+        lines.append(paint(tl + h * (w - 2) + tr, style))
     for row in rows:
         text, styles = (row, ()) if isinstance(row, str) else (row[0], row[1:])
         bullet = re.match(r"\s*(?:\d+\.|-)\s+", text)
         hang = " " * len(bullet.group(0)) if bullet else ""
         for piece in textwrap.wrap(text, inner, subsequent_indent=hang) or [""]:
             gap = max(0, inner - dwidth(piece))
-            left = gap // 2 if center else 0
-            line = " " * left + paint(piece, *styles) + " " * (gap - left)
-            out(paint(v, style) + " " + line + " " + paint(v, style))
-    out(paint(bl + h * (w - 2) + br, style))
-
-
-def banner() -> None:
-    title = f"{icon('ghost')}  SNAP STREAK RESTORE  {icon('fire')}".strip()
-    box(
-        [
-            (title, "yellow", "bold"),
-            ("Snapchat's official restore form,", "gray"),
-            ("filled in for you", "gray"),
-        ],
-        center=True,
-    )
+            lines.append(paint(v, style) + " " + paint(piece, *styles) + " " * gap + " " + paint(v, style))
+    lines.append(paint(bl + h * (w - 2) + br, style))
+    reveal(lines)
 
 
 def section(title: str) -> None:
-    h = "─" if T.fancy else "-"
+    thick, thin = ("━", "─") if T.fancy else ("=", "-")
     out()
-    out(paint(h * 2, "yellow") + " " + paint(title, "bold") + " " + paint(h * max(0, width() - dwidth(title) - 4), "yellow"))
+    out(gradient(thick * 2) + " " + paint(title, "bold") + " " + paint(thin * max(0, width() - dwidth(title) - 4), "faint"))
+
+
+def bar(fraction: float, size: int) -> str:
+    full = max(0, min(size, round(size * fraction)))
+    on, off = ("━", "─") if T.fancy else ("#", "-")
+    return gradient(on * full, size) + paint(off * (size - full), "faint")
+
+
+def progress(done: int, total: int, previous: int | None = None) -> None:
+    """A 'done/total' fire bar that fills up smoothly from `previous`."""
+    size = max(10, width() - 8)
+    label = paint(f" {done}/{total}", "gray")
+    if T.motion and previous is not None and previous != done:
+        hide_cursor()
+        for k in range(1, 11):
+            value = previous + (done - previous) * k / 10
+            sys.stdout.write(f"\r{MARGIN}{bar(value / total, size)}{label}\x1b[K")
+            sys.stdout.flush()
+            time.sleep(0.02)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    else:
+        out(bar(done / total, size) + label)
+
+
+def countdown(seconds: int) -> None:
+    """Wait between automatic sends, with a bar that drains."""
+    if seconds <= 0:
+        return
+    if not T.motion:
+        para(f"Waiting {seconds}s before the next one...", "gray")
+        time.sleep(seconds)
+        return
+    hide_cursor()
+    size = max(10, width() - 16)
+    end = time.time() + seconds
+    left = seconds
+    while left > 0:
+        sys.stdout.write(f"\r{MARGIN}{paint('Next in', 'gray')} {bar(left / seconds, size)} {paint(f'{math.ceil(left)}s', 'gray')}\x1b[K")
+        sys.stdout.flush()
+        time.sleep(0.05)
+        left = end - time.time()
+    sys.stdout.write("\r\x1b[K")
+    sys.stdout.flush()
+
+
+class Spinner:
+    """An animated 'working on it...' line.
+
+        with Spinner("Starting Chrome", announce=True) as spin:
+            ...
+            spin.ok("Chrome is ready")
+
+    Without animations it stays silent, unless `announce` asks for a plain
+    'Starting Chrome...' line (for things slow enough to need one).
+    """
+
+    def __init__(self, text: str, announce: bool = False):
+        self.text = text
+        self.announce = announce
+        self._stop = threading.Event()
+        self._thread = None
+
+    def __enter__(self):
+        if T.motion:
+            hide_cursor()
+            self._thread = threading.Thread(target=self._spin, daemon=True)
+            self._thread.start()
+        elif self.announce:
+            para(f"{self.text}...", "gray")
+        return self
+
+    def _spin(self) -> None:
+        frames = SPINNER_FRAMES[0 if T.fancy else 1]
+        tick = 0
+        while not self._stop.is_set():
+            frame = paint(frames[tick // 2 % len(frames)], FIRE[tick // 3 % len(FIRE)] if T.rich else "yellow")
+            sys.stdout.write(f"\r{MARGIN}{frame} {self.text}\x1b[K")
+            sys.stdout.flush()
+            tick += 1
+            self._stop.wait(0.08)
+
+    def _halt(self) -> None:
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join()
+            self._thread = None
+            sys.stdout.write("\r\x1b[K")
+            sys.stdout.flush()
+
+    def ok(self, text: str = "") -> None:
+        self._halt()
+        ok(text or self.text)
+
+    def warn(self, text: str) -> None:
+        self._halt()
+        warn(text)
+
+    def fail(self, text: str) -> None:
+        self._halt()
+        fail(text)
+
+    def __exit__(self, *exc) -> bool:
+        self._halt()
+        return False
 
 
 def read(prompt: str = "") -> str:
+    show_cursor()
     try:
         return input(prompt)
     except (EOFError, KeyboardInterrupt):
@@ -333,6 +618,10 @@ def read(prompt: str = "") -> str:
 
 def prompt_arrow() -> str:
     return MARGIN + paint(icon("arrow"), "yellow", "bold") + " "
+
+
+def pill(key: str) -> str:
+    return paint(f" {key} ", "pill") if T.color else f"[{key}]"
 
 
 def ask(label: str, default: str = "", hint: str = "", validate=None) -> str:
@@ -356,9 +645,12 @@ def ask(label: str, default: str = "", hint: str = "", validate=None) -> str:
 
 
 def confirm(question: str, default: bool = True) -> bool:
-    choices = "Y/n" if default else "y/N"
+    choices = paint("[Y/n]" if default else "[y/N]", "gray")
+    *first, last = textwrap.wrap(question, width() - 7) or [""]
     while True:
-        raw = read(f"{MARGIN}{paint(question, 'bold')} {paint('[' + choices + ']', 'gray')} ").strip().lower()
+        for line in first:
+            out(paint(line, "bold"))
+        raw = read(f"{MARGIN}{paint(last, 'bold')} {choices} ").strip().lower()
         if not raw:
             return default
         if raw in ("y", "yes"):
@@ -368,19 +660,17 @@ def confirm(question: str, default: bool = True) -> bool:
 
 
 def key_hints(pairs) -> None:
-    """Print 'Enter sent it · r reopen · ...', wrapped to the screen width."""
-    sep = f" {paint(icon('dot'), 'gray')} "
+    """Print ' Enter  I sent it   r  reopen ...', wrapped to the screen width."""
     lines, line = [], ""
     for key, label in pairs:
-        part = f"{paint(key, 'yellow', 'bold')} {label}"
-        candidate = line + sep + part if line else part
+        part = f"{pill(key)} {paint(label, 'gray')}"
+        candidate = f"{line}  {part}" if line else part
         if line and dwidth(candidate) > width():
             lines.append(line)
             candidate = part
         line = candidate
     lines.append(line)
-    for text in lines:
-        out(text)
+    reveal(lines)
 
 
 def choose(pairs) -> str:
@@ -392,9 +682,7 @@ def choose(pairs) -> str:
 def menu(options) -> str:
     """options: (key, label, note) tuples. Returns what the user typed."""
     out()
-    for key, label, note in options:
-        extra = f"  {paint(note, 'gray')}" if note else ""
-        out(f"{paint(key.rjust(2), 'yellow', 'bold')}  {label}{extra}")
+    reveal(f"{pill(key)}  {label}" + (f"  {paint(note, 'gray')}" if note else "") for key, label, note in options)
     out()
     return read(prompt_arrow()).strip().lower()
 
@@ -402,13 +690,6 @@ def menu(options) -> str:
 def pause(text: str = "Press Enter to go back") -> None:
     out()
     read(MARGIN + paint(text, "gray") + " ")
-
-
-def countdown(seconds: int) -> None:
-    for left in range(seconds, 0, -1):
-        print(f"\r{MARGIN}{paint(f'Next one in {left}s...', 'gray')}   ", end="", flush=True)
-        time.sleep(1)
-    print("\r" + " " * (width() + len(MARGIN)) + "\r", end="", flush=True)
 
 
 def when(stamp: str) -> str:
@@ -424,6 +705,44 @@ def when(stamp: str) -> str:
 
 def is_termux() -> bool:
     return "com.termux" in os.environ.get("PREFIX", "")
+
+
+def on_phone() -> bool:
+    return (
+        is_termux()
+        or hasattr(sys, "getandroidapilevel")
+        or sys.platform == "ios"
+        or platform.machine().startswith(("iPhone", "iPad"))
+    )
+
+
+def selenium_available() -> bool:
+    try:
+        return importlib.util.find_spec("selenium") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def resolve_method(method: str) -> str:
+    """Turn the 'auto' setting into 'chrome' or 'link' for this device."""
+    if method != "auto":
+        return method
+    return "chrome" if not on_phone() and selenium_available() else "link"
+
+
+def snapchat_reachable(locale: str, timeout: float = 4) -> bool:
+    request = urllib.request.Request(
+        f"{HELP_CENTER}/hc/{locale}",
+        method="HEAD",
+        headers={"User-Agent": f"Mozilla/5.0 ({APP_NAME}/{VERSION})"},
+    )
+    try:
+        urllib.request.urlopen(request, timeout=timeout).close()
+        return True
+    except urllib.error.HTTPError:
+        return True  # it answered, even if not with a 200
+    except Exception:
+        return False
 
 
 def open_in_browser(url: str) -> bool:
@@ -516,6 +835,10 @@ class Store:
         for key, value in (data.get("settings") or {}).items():
             if key in DEFAULT_SETTINGS and type(value) is type(DEFAULT_SETTINGS[key]):
                 self.settings[key] = value
+        if data.get("version", 1) < 2:  # 2.0 made auto-submit the default
+            if self.settings["method"] == "link":
+                self.settings["method"] = "auto"
+            self.settings["auto_submit"] = True
         if self.settings["method"] not in METHODS:
             self.settings["method"] = DEFAULT_SETTINGS["method"]
         self.saved = [str(name) for name in data.get("saved_friends") or []]
@@ -525,7 +848,7 @@ class Store:
     def save(self) -> None:
         payload = {
             "app": APP_NAME,
-            "version": 1,
+            "version": DATA_VERSION,
             "profile": self.profile,
             "settings": self.settings,
             "saved_friends": self.saved,
@@ -567,6 +890,14 @@ class Store:
         sent = [e for e in self.history if e.get("status") == "submitted"]
         today = date.today().isoformat()
         return len(sent), sum(1 for e in sent if str(e.get("at", "")).startswith(today))
+
+
+def engine_label(store: Store) -> str:
+    method = resolve_method(store.settings["method"])
+    label = METHODS[method][0]
+    if method == "chrome":
+        label += ", auto-submit " + ("on" if store.settings["auto_submit"] else "off")
+    return label
 
 
 # --------------------------------------------------------------------------
@@ -617,8 +948,12 @@ class LinkRunner:
                 return "stop"
 
     def _open(self, url: str) -> None:
-        if open_in_browser(url):
-            ok("Opened the form with everything filled in.")
+        with Spinner("Opening the form") as spin:
+            opened = open_in_browser(url)
+            linger(0.3)
+            if opened:
+                spin.ok("Opened the form with everything filled in.")
+        if opened:
             para("Check it, tap Submit, then come back here.", "gray")
         else:
             warn("Couldn't open your browser automatically. Open this link:")
@@ -639,7 +974,7 @@ class LinkRunner:
 
 
 class ChromeRunner:
-    """Drives a real Chrome window with Selenium and types into the form."""
+    """Drives a real Chrome window with Selenium, types into the form and submits it."""
 
     name = "chrome"
 
@@ -674,14 +1009,15 @@ class ChromeRunner:
             if browser:
                 options.binary_location = browser
             driver_path = shutil.which("chromedriver")
-        para("Starting Chrome...", "gray")
-        try:
-            service = sel.Service(executable_path=driver_path) if driver_path else sel.Service()
-            self.driver = sel.webdriver.Chrome(options=options, service=service)
-        except Exception as exc:
-            fail(f"Chrome didn't start: {_short_error(exc)}")
-            para("Make sure Google Chrome is installed and Selenium is up to date (pip install -U selenium).", "gray")
-            return False
+        with Spinner("Starting Chrome", announce=True) as spin:
+            try:
+                service = sel.Service(executable_path=driver_path) if driver_path else sel.Service()
+                self.driver = sel.webdriver.Chrome(options=options, service=service)
+            except Exception as exc:
+                spin.fail(f"Chrome didn't start: {_short_error(exc)}")
+                para("Make sure Google Chrome is installed and Selenium is up to date (pip install -U selenium).", "gray")
+                return False
+            spin.ok("Chrome is ready")
         return True
 
     def _alive(self) -> bool:
@@ -705,9 +1041,9 @@ class ChromeRunner:
         filled = self._fill(friend)
         if filled == "ok" and self.auto:
             if self._submit():
-                ok("Sent!")
+                ok("Sent to Snapchat Support!")
                 return "submitted"
-            warn("The form is still open. Snapchat may want a quick check (like a captcha) or something needs fixing.")
+            warn("Snapchat didn't take it automatically. It may want a quick check (like a captcha) or something needs fixing.")
         if self.headless:
             para("Chrome is hidden, so this one can't be finished by hand. Turn off 'Hidden Chrome window' in Settings to see it.", "gray")
             return "failed"
@@ -724,7 +1060,7 @@ class ChromeRunner:
                 return "submitted"
             if key == "r" and self._fill(friend) == "ok" and self.auto:
                 if self._submit():
-                    ok("Sent!")
+                    ok("Sent to Snapchat Support!")
                     return "submitted"
                 warn("Still not sent. Finish it in the Chrome window.")
             elif key == "s":
@@ -738,37 +1074,39 @@ class ChromeRunner:
         if not self._alive() and not self._launch():
             return "error"
         driver = self.driver
-        try:
-            driver.get(form_url(self.store.settings["locale"], self.store.profile, friend))
-            sel.Wait(driver, 25).until(
-                lambda d: d.find_elements(sel.By.NAME, field_name("friend"))
-                or d.find_elements(sel.By.CSS_SELECTOR, "form#new_request")
-            )
-        except sel.Timeout:
-            fail("The form didn't load in time. Check your internet connection.")
-            return "error"
-        except sel.DriverError as exc:
-            fail(f"Chrome had a problem: {_short_error(exc)}")
-            return "error"
+        with Spinner("Opening the form", announce=True) as spin:
+            try:
+                driver.get(form_url(self.store.settings["locale"], self.store.profile, friend))
+                sel.Wait(driver, 25).until(
+                    lambda d: d.find_elements(sel.By.NAME, field_name("friend"))
+                    or d.find_elements(sel.By.CSS_SELECTOR, "form#new_request")
+                )
+            except sel.Timeout:
+                spin.fail("The form didn't load in time. Check your internet connection.")
+                return "error"
+            except sel.DriverError as exc:
+                spin.fail(f"Chrome had a problem: {_short_error(exc)}")
+                return "error"
         self._accept_cookies()
 
         missing = []
-        for key, value in field_values(self.store.profile, friend).items():
-            element = self._find(field_name(key))
-            if element is None:
-                missing.append(key)
-                continue
-            try:
-                element.clear()
-                element.send_keys(value)
-            except sel.DriverError:
-                missing.append(key)
-        for element in driver.find_elements(sel.By.NAME, "request[anonymous_requester_email]"):
-            try:  # Zendesk's built-in "your email" box, if this form shows one
-                if element.is_displayed() and not element.get_attribute("value"):
-                    element.send_keys(self.store.profile["email"])
-            except Exception:
-                pass
+        with Spinner("Typing in your details"):
+            for key, value in field_values(self.store.profile, friend).items():
+                element = self._find(field_name(key))
+                if element is None:
+                    missing.append(key)
+                    continue
+                try:
+                    element.clear()
+                    element.send_keys(value)
+                except sel.DriverError:
+                    missing.append(key)
+            for element in driver.find_elements(sel.By.NAME, "request[anonymous_requester_email]"):
+                try:  # Zendesk's built-in "your email" box, if this form shows one
+                    if element.is_displayed() and not element.get_attribute("value"):
+                        element.send_keys(self.store.profile["email"])
+                except sel.DriverError:
+                    pass
         if missing:
             warn(f"Couldn't fill: {', '.join(missing)}. Snapchat may have changed the form.")
             para("Fill those in the Chrome window, and see 'If the form changes' in the README.", "gray")
@@ -777,6 +1115,10 @@ class ChromeRunner:
         return "ok"
 
     def _submit(self) -> bool:
+        with Spinner("Sending to Snapchat Support", announce=True):
+            return self._click_submit_and_wait()
+
+    def _click_submit_and_wait(self) -> bool:
         sel = self.sel
         driver = self.driver
         field = self._find(field_name("friend"))
@@ -859,12 +1201,35 @@ def _load_selenium():
 
 def _short_error(exc: Exception) -> str:
     text = (getattr(exc, "msg", None) or str(exc) or type(exc).__name__).strip()
-    return text.splitlines()[0][:160]
+    return text.splitlines()[0].split("; For documentation")[0][:160]
 
 
 # --------------------------------------------------------------------------
 # Screens
 # --------------------------------------------------------------------------
+
+def boot(store: Store) -> None:
+    """Animated intro plus a quick check that everything's ready."""
+    online = []  # checked in the background while the logo animates
+    check = threading.Thread(target=lambda: online.append(snapchat_reachable(store.settings["locale"])), daemon=True)
+    check.start()
+    clear()
+    header(intro=True)
+    out()
+    with Spinner("Loading your profile") as spin:
+        linger(0.35)
+        spin.ok(f"Profile: {store.profile['username']}" if store.profile else "New here? Let's set you up.")
+    with Spinner("Connecting to Snapchat Support", announce=True) as spin:
+        check.join()
+        if online and online[0]:
+            spin.ok("Snapchat Support is online")
+        else:
+            spin.warn("Can't reach help.snapchat.com right now. Check your internet.")
+    with Spinner("Starting the fill engine") as spin:
+        linger(0.35)
+        spin.ok(f"Fill engine: {engine_label(store)}")
+    linger(0.6)
+
 
 def setup_profile(store: Store) -> None:
     old = store.profile or {}
@@ -886,8 +1251,10 @@ def setup_profile(store: Store) -> None:
             break
         old = profile
     store.profile = profile
-    store.save()
-    ok("Saved.")
+    with Spinner("Saving") as spin:
+        store.save()
+        linger(0.3)
+        spin.ok("Saved.")
 
 
 def collect_friends(store: Store, existing=()):
@@ -927,12 +1294,13 @@ def review(store: Store, friends: list, from_saved: bool = False):
     friends = list(friends)
     while True:
         section("Ready to restore")
-        for number, name in enumerate(friends, 1):
-            out(f"{paint(str(number).rjust(2), 'gray')}  {icon('fire')} {name}")
+        reveal(f"{paint(str(n).rjust(2), 'gray')}  {icon('fire')} {name}" for n, name in enumerate(friends, 1))
         if not friends:
             para("The list is empty.", "gray")
         out()
-        para(f"Fill method: {METHODS[store.settings['method']][0]}", "gray")
+        para(f"Fill method: {engine_label(store)}", "gray")
+        if resolve_method(store.settings["method"]) == "link" and not on_phone() and not selenium_available():
+            para("Tip: run 'pip install selenium' and the app will press Submit for you.", "gray")
         pairs = [("Enter", "start"), ("a", "add"), ("d 2", "remove #2"), ("b", "back")]
         if not friends:
             pairs = pairs[1:2] + pairs[3:]
@@ -956,7 +1324,8 @@ def review(store: Store, friends: list, from_saved: bool = False):
 
 
 def run_restore(store: Store, friends: list) -> None:
-    runner = ChromeRunner(store) if store.settings["method"] == "chrome" else LinkRunner(store)
+    method = resolve_method(store.settings["method"])
+    runner = ChromeRunner(store) if method == "chrome" else LinkRunner(store)
     if not runner.start():
         if not confirm("Use the pre-filled link method instead?"):
             return
@@ -964,10 +1333,13 @@ def run_restore(store: Store, friends: list) -> None:
 
     results = {"submitted": [], "skipped": [], "failed": []}
     left_over = []
+    shown = None
     try:
         for number, friend in enumerate(friends, 1):
             section(f"Streak {number} of {len(friends)}")
-            out(f"{icon('fire')} {paint(friend, 'yellow', 'bold')}")
+            progress(number - 1, len(friends), shown)
+            shown = number - 1
+            typewrite(MARGIN, f"{icon('fire')} {friend}", "yellow", "bold")
             status = runner.restore(friend)
             if status == "stop":
                 left_over = friends[number - 1:]
@@ -981,6 +1353,7 @@ def run_restore(store: Store, friends: list) -> None:
         runner.close()
 
     section("Done" if not left_over else "Stopped")
+    progress(len(friends) - len(left_over), len(friends), shown)
     rows = []
     for status, names in results.items():
         if names:
@@ -989,7 +1362,10 @@ def run_restore(store: Store, friends: list) -> None:
     if left_over:
         rows.append((f"{icon('warn')} {len(left_over)} not done: {', '.join(left_over)}", "yellow"))
     box(rows or ["Nothing was sent."], title="Summary")
-    if results["submitted"]:
+    sent = len(results["submitted"])
+    if sent:
+        out()
+        typewrite(MARGIN, f"{icon('fire')} {sent} streak request{'s' if sent != 1 else ''} sent!", "yellow", "bold")
         para("Snapchat Support replies by email. Your list is saved, so you can send it again any time with Quick restore.", "gray")
     pause("Press Enter for the menu")
 
@@ -1017,59 +1393,67 @@ def history_screen(store: Store) -> None:
         pause()
         return
     total, today = store.sent_counts()
-    para(f"{total} requests sent, {today} today.", "gray")
+    para(f"{total} request{'s' if total != 1 else ''} sent, {today} today.", "gray")
     out()
-    name_width = min(18, max(dwidth(str(e.get("friend", ""))) for e in store.history[-15:]))
-    for entry in reversed(store.history[-15:]):
-        symbol, color, word = STATUS_LOOK.get(entry.get("status"), ("warn", "yellow", "?"))
+    recent = store.history[-15:]
+    name_width = min(18, max(dwidth(str(e.get("friend", ""))) for e in recent))
+    lines = []
+    for entry in reversed(recent):
+        symbol, color, _ = STATUS_LOOK.get(entry.get("status"), ("warn", "yellow", "?"))
         friend = str(entry.get("friend", "?"))
-        out(f"{paint(icon(symbol), color)} {friend.ljust(name_width)} {paint(when(entry.get('at', '')), 'gray')}")
+        lines.append(f"{paint(icon(symbol), color)} {friend.ljust(name_width)} {paint(when(entry.get('at', '')), 'gray')}")
+    reveal(lines)
     pause()
 
 
 def settings_screen(store: Store) -> None:
     while True:
         s = store.settings
-        section("Settings")
+        chrome = resolve_method(s["method"]) == "chrome"
         on_off = {True: "on", False: "off"}
-        options = [
-            ("1", "Fill method:", METHODS[s["method"]][0]),
-            ("2", "Wait between auto-sends:", f"{s['delay']}s"),
-            ("3", "Help center language:", s["locale"]),
-            ("4", "Colors:", s["colors"]),
-        ]
-        if s["method"] == "chrome":
+        section("Settings")
+        options = [("1", "Fill method:", METHODS[s["method"]][0])]
+        if chrome:
             options += [
-                ("5", "Auto-submit:", on_off[s["auto_submit"]]),
-                ("6", "Hidden Chrome window:", on_off[s["headless"]]),
+                ("2", "Auto-submit:", on_off[s["auto_submit"]]),
+                ("3", "Wait between sends:", f"{s['delay']}s"),
+                ("4", "Hidden Chrome window:", on_off[s["headless"]]),
             ]
-        options += [("9", "Delete all my saved data", ""), ("0", "Back", "")]
+        options += [
+            ("5", "Help center language:", s["locale"]),
+            ("6", "Colors:", s["colors"]),
+            ("7", "Animations:", on_off[s["animations"]]),
+            ("9", "Delete all my saved data", ""),
+            ("0", "Back", ""),
+        ]
         key = menu(options)
         if key in ("0", "b", "q", ""):
             return
         if key == "1":
             pick_method(store)
-        elif key == "2":
-            seconds = ask("Seconds to wait between automatic sends", str(s["delay"]), validate=_check_delay)
-            s["delay"] = int(seconds)
-        elif key == "3":
+        elif key == "2" and chrome:
+            s["auto_submit"] = not s["auto_submit"]
+            if s["auto_submit"]:
+                para("Chrome will press Submit for you, waiting between friends so Snapchat isn't flooded.", "gray")
+        elif key == "3" and chrome:
+            s["delay"] = int(ask("Seconds to wait between automatic sends", str(s["delay"]), validate=_check_delay))
+        elif key == "4" and chrome:
+            s["headless"] = not s["headless"]
+            if s["headless"]:
+                para("Chrome will run out of sight and always auto-submit. If Snapchat asks for a captcha you won't see it, so turn this off if requests fail.", "gray")
+        elif key == "5":
             s["locale"] = ask(
                 "Help center language",
                 s["locale"],
                 hint="The part after /hc/ in Snapchat help links, e.g. en-us, en-gb, fr-fr, de-de.",
                 validate=_check_locale,
             )
-        elif key == "4":
+        elif key == "6":
             s["colors"] = {"auto": "on", "on": "off", "off": "auto"}[s["colors"]]
-            setup_terminal(s["colors"])
-        elif key == "5" and s["method"] == "chrome":
-            s["auto_submit"] = not s["auto_submit"]
-            if s["auto_submit"]:
-                para("Chrome will press Submit for you, waiting between friends so Snapchat isn't flooded.", "gray")
-        elif key == "6" and s["method"] == "chrome":
-            s["headless"] = not s["headless"]
-            if s["headless"]:
-                para("Chrome will run out of sight and always auto-submit. If Snapchat asks for a captcha you won't see it, so turn this off if requests fail.", "gray")
+            setup_terminal(s["colors"], s["animations"])
+        elif key == "7":
+            s["animations"] = not s["animations"]
+            setup_terminal(s["colors"], s["animations"])
         elif key == "9":
             out()
             para("This deletes your details, saved list, history and settings from this device.", "yellow")
@@ -1086,12 +1470,13 @@ def settings_screen(store: Store) -> None:
 def pick_method(store: Store) -> None:
     section("Fill method")
     keys = list(METHODS)
+    lines = []
     for number, key in enumerate(keys, 1):
         label, about = METHODS[key]
         current = "  (current)" if key == store.settings["method"] else ""
-        out(f"{paint(str(number).rjust(2), 'yellow', 'bold')}  {paint(label, 'bold')}{paint(current, 'gray')}")
-        for line in textwrap.wrap(about, width() - 4):
-            out("    " + paint(line, "gray"))
+        lines.append(f"{pill(str(number))}  {paint(label, 'bold')}{paint(current, 'gray')}")
+        lines += ["     " + paint(line, "gray") for line in textwrap.wrap(about, width() - 5)]
+    reveal(lines)
     out()
     choice = read(prompt_arrow()).strip()
     if choice.isdigit() and 1 <= int(choice) <= len(keys):
@@ -1113,15 +1498,13 @@ def _check_locale(raw: str):
 
 
 def welcome(store: Store) -> None:
-    clear()
-    banner()
     out()
     box([
         "Get your lost Snapchat Streaks back through Snapchat's own support form:",
         "",
         "1. Enter your details (only the first time)",
         "2. Type the usernames of the friends you lost streaks with",
-        "3. The form opens already filled in. Tap Submit, done!",
+        "3. The app fills in the form for every friend and sends it",
     ], title="How it works", style="cyan")
     setup_profile(store)
 
@@ -1129,17 +1512,18 @@ def welcome(store: Store) -> None:
 def main_menu(store: Store) -> None:
     while True:
         if store.profile is None:
+            clear()
+            header()
             welcome(store)
             restore_flow(store)
             continue
         clear()
-        banner()
+        header()
         out()
-        greeting = f"Hey {paint(store.profile['username'], 'yellow', 'bold')}"
-        out(f"{greeting} {icon('wave')}".rstrip())
+        out(f"Hey {paint(store.profile['username'], 'yellow', 'bold')} {icon('wave')}".rstrip())
         total, today = store.sent_counts()
         if total:
-            para(f"{total} requests sent so far, {today} today.", "gray")
+            para(f"{total} request{'s' if total != 1 else ''} sent so far, {today} today.", "gray")
         saved_note = f"{len(store.saved)} saved" if store.saved else "none saved yet"
         key = menu([
             ("1", "Restore streaks", ""),
@@ -1178,13 +1562,14 @@ def print_links(store: Store, friends: list) -> None:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Fills in Snapchat's streak restore support form for you.",
+        description="Sends Snapchat streak restore requests for you through Snapchat's support form.",
     )
     parser.add_argument("friends", nargs="*", metavar="USERNAME", help="friends to restore streaks with (skips typing them in)")
     parser.add_argument("--links", action="store_true", help="just print a pre-filled form link for each friend and exit")
     parser.add_argument("--method", choices=sorted(METHODS), help="fill method to use (remembered for next time)")
     parser.add_argument("--data", type=Path, help=f"where to keep your saved data (default: {DATA_FILE_NAME} next to this script)")
     parser.add_argument("--no-color", action="store_true", help="plain text, no colors")
+    parser.add_argument("--no-anim", action="store_true", help="no animations")
     parser.add_argument("--version", action="version", version=f"{APP_NAME} {VERSION}")
     return parser.parse_args(argv)
 
@@ -1193,7 +1578,8 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     store = Store(args.data or default_data_path())
     problem = store.load()
-    setup_terminal("off" if args.no_color else store.settings["colors"])
+    setup_terminal("off" if args.no_color else store.settings["colors"], store.settings["animations"] and not args.no_anim)
+    atexit.register(show_cursor)
     if problem:
         warn(problem)
     if args.method:
@@ -1209,19 +1595,23 @@ def main(argv=None) -> int:
                 elif name.lower() not in {f.lower() for f in friends}:
                     friends.append(name)
 
-        first_time = store.profile is None
-        if first_time:
-            welcome(store)
-
         if args.links:
+            if store.profile is None:
+                welcome(store)
             print_links(store, friends or collect_friends(store) or [])
             return 0
+
+        first_time = store.profile is None
+        boot(store)
+        if first_time:
+            welcome(store)
         if friends:
             restore_flow(store, friends)
         elif first_time:
             restore_flow(store)
         main_menu(store)
     except (Quit, KeyboardInterrupt):
+        show_cursor()
         print()
         out(paint(f"Bye! Good luck with your streaks {icon('fire')}".strip(), "yellow"))
     return 0

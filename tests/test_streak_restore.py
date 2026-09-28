@@ -83,7 +83,29 @@ class StoreTest(unittest.TestCase):
             store.load()
             self.assertIsNone(store.profile)
             self.assertEqual(store.settings["delay"], sr.DEFAULT_SETTINGS["delay"])
-            self.assertEqual(store.settings["method"], "link")
+            self.assertEqual(store.settings["method"], sr.DEFAULT_SETTINGS["method"])
+
+    def test_old_files_switch_to_auto_submit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "data.json"
+            old = {"version": 1, "settings": {"method": "link", "auto_submit": False, "delay": 5}}
+            path.write_text(json.dumps(old))
+            store = sr.Store(path)
+            store.load()
+            self.assertEqual(store.settings["method"], "auto")
+            self.assertTrue(store.settings["auto_submit"])
+            self.assertEqual(store.settings["delay"], 5)
+
+    def test_new_files_keep_their_choices(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "data.json"
+            store = sr.Store(path)
+            store.settings.update(method="link", auto_submit=False)
+            store.save()
+            again = sr.Store(path)
+            again.load()
+            self.assertEqual(again.settings["method"], "link")
+            self.assertFalse(again.settings["auto_submit"])
 
     def test_broken_file_is_kept_aside(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -92,6 +114,22 @@ class StoreTest(unittest.TestCase):
             store = sr.Store(path)
             self.assertIn("Starting fresh", store.load())
             self.assertTrue((Path(folder) / "data.json.broken").exists())
+
+
+class MethodTest(unittest.TestCase):
+    def test_explicit_methods_are_kept(self):
+        self.assertEqual(sr.resolve_method("link"), "link")
+        self.assertEqual(sr.resolve_method("chrome"), "chrome")
+
+    def test_auto_picks_chrome_only_on_a_computer_with_selenium(self):
+        originals = sr.on_phone, sr.selenium_available
+        try:
+            for phone, selenium, expected in [(False, True, "chrome"), (False, False, "link"), (True, True, "link")]:
+                sr.on_phone = lambda: phone
+                sr.selenium_available = lambda: selenium
+                self.assertEqual(sr.resolve_method("auto"), expected)
+        finally:
+            sr.on_phone, sr.selenium_available = originals
 
 
 class LookTest(unittest.TestCase):
