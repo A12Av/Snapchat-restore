@@ -1,0 +1,8 @@
+# Your personal details and history - never commit these
+streak_restore_data.json
+streak_restore_data.json.*
+
+__pycache__/
+*.pyc
+.venv/
+venv/

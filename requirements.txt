@@ -1,0 +1,3 @@
+# Nothing is needed for the normal (pre-filled link) mode.
+# Only for the optional "Chrome autopilot" fill method on computers:
+selenium>=4.10
